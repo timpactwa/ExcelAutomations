@@ -3,6 +3,7 @@ Author: Timothy Pactwa
 Version: 6/3/2026
 '''
 
+import re
 import sys
 import pandas as pd
 from PyQt6.QtWidgets import (
@@ -124,11 +125,14 @@ class MainWindow(QMainWindow):
         manufacturers_dict = {
             "QUALITY STEEL": "QUALITY STL",
             "AMERICAN WELDING AND TANK": "AWT",
+            "NATIONAL BUTANE": "NAT BUTANE",
+            "AMERICAN": "AWT"
         }
         def normalize_manufacturer(manufacturer):
             if pd.isna(manufacturer):
                 return "UNKNOWN"
-            if len(str(manufacturer)) <= MANUFACTURER_MAX_LEN:
+            manufacturer = str(manufacturer).strip().upper()
+            if len(manufacturer) <= MANUFACTURER_MAX_LEN:
                 return manufacturer
             if manufacturer in manufacturers_dict:
                 return manufacturers_dict[manufacturer]
@@ -136,10 +140,62 @@ class MainWindow(QMainWindow):
         if "Manufacturer" in df.columns:
             df["Manufacturer"] = df["Manufacturer"].apply(normalize_manufacturer)
 
-        # fill empty dates with default
-        default_year = 1900
+        # ends-with-DOT wins; otherwise any ASME variation → "ASME"
+        def normalize_type(val):
+            if pd.isna(val):
+                return val
+            s = str(val).strip()
+            if re.search(r'DOT\s*$', s, re.IGNORECASE):
+                return "DOT"
+            if re.search(r'a\.?s\.?m\.?e\.?', s, re.IGNORECASE):
+                return "ASME"
+            return s
+        if "Type" in df.columns:
+            df["Type"] = df["Type"].apply(normalize_type)
+
+        # ASME → 4-digit year only; DOT → MM/YY (defaults month to 01 if only year given)
+        def normalize_date(val, tank_type):
+            if pd.isna(val):
+                return val
+            s = str(val).strip()
+            # pandas reads plain years as floats (e.g. 2005.0) — convert back
+            try:
+                n = float(s)
+                if n == int(n):
+                    s = str(int(n))
+            except ValueError:
+                pass
+            sep = re.match(r'^(\d{1,2})[/\-\. ](\d{2,4})$', s)
+            if sep:
+                month = sep.group(1).zfill(2)
+                yr = sep.group(2)
+                year4 = yr if len(yr) == 4 else ("20" + yr if int(yr) < 50 else "19" + yr)
+            elif re.match(r'^\d{4}$', s):
+                month, year4 = "01", s
+            elif re.match(r'^\d{2}$', s):
+                month = "01"
+                year4 = ("20" + s if int(s) < 50 else "19" + s)
+            else:
+                return s  # unrecognized — leave as-is
+            if tank_type == "DOT":
+                return f"{month} {year4[2:]}"
+            return year4  # ASME and fallback: year only
+
         if "ManufacturerDate" in df.columns:
-            df["ManufacturerDate"] = df["ManufacturerDate"].fillna(default_year)
+            if "Type" in df.columns:
+                df["ManufacturerDate"] = df.apply(
+                    lambda row: normalize_date(row["ManufacturerDate"], row["Type"]), axis=1
+                )
+            else:
+                df["ManufacturerDate"] = df["ManufacturerDate"].fillna(1900)
+
+        if "Activity" in df.columns:
+            df["Activity"] = df["Activity"].fillna(1)
+        if "Source" in df.columns:
+            df["Source"] = df["Source"].fillna("Miscellaneous")
+        if "Activity date" in df.columns:
+            today = pd.Timestamp.today().strftime("%m/%d/%Y")
+            df["Activity date"] = df["Activity date"].fillna(today)
 
     # pandas reads integer columns with any NaN as float64, so 1 becomes 1.0 — convert back
     def _cell_str(self, df, r, c):
@@ -165,6 +221,16 @@ class MainWindow(QMainWindow):
 
         mfr_col = headers.index("Manufacturer") if "Manufacturer" in headers else -1
         equipment_type_col = headers.index("Equipment Type") if "Equipment Type" in headers else -1
+        serv_loc_col = headers.index("Serv loc") if "Serv loc" in headers else -1
+        type_col = headers.index("Type") if "Type" in headers else -1
+        size_pounds_col = headers.index("SizePounds") if "SizePounds" in headers else -1
+
+        def _is_numeric(v):
+            try:
+                float(v)
+                return True
+            except (ValueError, TypeError):
+                return False
 
         for r in range(rows):
             for c in range(cols):
@@ -174,8 +240,19 @@ class MainWindow(QMainWindow):
 
                 # long manufacturer not found in lookup dict — flag orange on both sides
                 is_mfr_miss = (c == mfr_col and not changed and len(orig_val) > MANUFACTURER_MAX_LEN)
-                # equipment type must be 1 — flag red in cleaned output
+                # equipment type must be 1. Flag red in cleaned output
                 is_invalid_equipment_type = (c == equipment_type_col and clean_val != "1")
+                # Serv loc must be numeric — flag red on both sides
+                is_serv_loc_invalid = (
+                    serv_loc_col != -1 and c == serv_loc_col
+                    and clean_val != "" and not _is_numeric(clean_val)
+                )
+                # DOT tank with no size — flag SizePounds red on cleaned side
+                is_dot_no_size = (
+                    size_pounds_col != -1 and type_col != -1 and c == size_pounds_col
+                    and self._cell_str(cleaned, r, type_col) == "DOT"
+                    and clean_val == ""
+                )
 
                 # original side: read-only; red if a change was made, orange if manufacturer needs review
                 # strip the editable flag via bitwise AND with its complement
@@ -185,6 +262,8 @@ class MainWindow(QMainWindow):
                     orig_item.setBackground(RED)
                 elif is_mfr_miss:
                     orig_item.setBackground(ORANGE)
+                elif is_serv_loc_invalid:
+                    orig_item.setBackground(RED)
                 self.original_table.setItem(r, c, orig_item)
 
                 # cleaned side: green if normalized, orange if manufacturer needs review
@@ -195,8 +274,8 @@ class MainWindow(QMainWindow):
                     clean_item.setBackground(ORANGE)
                 self.cleaned_table.setItem(r, c, clean_item)
 
-                # equipment type check overrides other colors
-                if is_invalid_equipment_type:
+                # these checks override other colors on the cleaned side
+                if is_invalid_equipment_type or is_serv_loc_invalid or is_dot_no_size:
                     clean_item.setBackground(RED)
 
     # read back from the live table so any manual edits in the UI are captured
