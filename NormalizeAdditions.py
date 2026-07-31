@@ -1,10 +1,32 @@
 '''
+Clean a propane-tank "additions" file and review it side by side.
+
+Open an Excel workbook (preferred) or a CSV, normalize every column against the
+rules the downstream system expects, and save the result as a CSV. The window
+shows the original and the cleaned data next to each other so the operator can
+see what changed and fix anything the rules could not resolve.
+
+Excel is the better input: a CSV only carries the text a cell *displays*, so a
+date shown as "Dec-95" has already lost the real 12/1/1995 behind it. Reading
+the workbook hands us the underlying value instead of a formatting guess.
+
+Cell colors
+    RED     required field is empty or invalid — must be fixed
+    ORANGE  cleaned, but a human should confirm it
+    GREEN   cleaned side: the value was changed and passed validation
+    BLUE    original side: this cell was changed by cleaning
+
+Layout: the cleaning and validation rules are plain functions over strings with
+no Qt in sight, so they can be exercised headless. `MainWindow` only displays
+what `normalize_dataframe` decided.
+
 Author: Timothy Pactwa
-Version: 6/3/2026
+Version: 7/31/2026
 '''
 
 import re
 import sys
+from datetime import date
 import pandas as pd
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -14,18 +36,422 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 
-RED = QColor("#ffcccc")
-GREEN = QColor("#ccffcc")
-ORANGE = QColor("#ffd9a0")
+RED = QColor("#ffcccc")      # hard error: required field is empty or invalid
+GREEN = QColor("#ccffcc")    # cleaned side: value was normalized and passed validation
+ORANGE = QColor("#ffd9a0")   # warning: needs a human to review
+BLUE = QColor("#d0e4ff")     # original side: cell was changed by cleaning
 
 MANUFACTURER_MAX_LEN = 12
+SIZE_GALLONS_MIN = 57
+SIZE_GALLONS_MAX = 5000
 
-# UI inherits from Qt6's Main Window
+# Excel counts days from here (serial 0); the offset absorbs its 1900 leap bug
+EXCEL_EPOCH = date(1899, 12, 30)
+
+# Excel writes month names into CSVs whenever the cell is formatted that way
+MONTHS = {
+    "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04", "MAY": "05", "JUN": "06",
+    "JUL": "07", "AUG": "08", "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12",
+}
+
+# long manufacturer names -> approved short codes (<=12 chars); misses stay as-is and flag orange
+MANUFACTURERS = {
+    "QUALITY STEEL": "QUALITY STL",
+    "AMERICAN WELDING AND TANK": "AWT",
+    "NATIONAL BUTANE": "NAT BUTANE",
+    "AMERICAN": "AWT",
+}
+
+
+# ---------------------------------------------------------------------------
+# Cleaning / validation logic (kept free of Qt so it can be tested headless)
+# ---------------------------------------------------------------------------
+
+def _is_blank(v):
+    """True for None, NaN, an empty cell, or a string of only whitespace."""
+    if v is None:
+        return True
+    if isinstance(v, float) and pd.isna(v):
+        return True
+    return str(v).strip() == ""
+
+
+def _is_numeric(v):
+    """True if the value reads as a number once commas are ignored."""
+    if _is_blank(v):
+        return False
+    try:
+        float(str(v).replace(",", "").strip())
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _as_text(v):
+    """Every cleaner's starting point: a trimmed string, blank for empty."""
+    return "" if _is_blank(v) else str(v).strip()
+
+
+# ---------------------------------------------------------------------------
+# Per-column cleaners. Each takes one cell and returns the cleaned string.
+# ---------------------------------------------------------------------------
+
+def _normalize_serial(v):
+    # kept verbatim as text so values like "12E45" never become 1.2e+46
+    return _as_text(v)
+
+
+def _normalize_customer_owned(v):
+    # anything starting with y/n answers the question; the rest flags later
+    s = _as_text(v)
+    if s.lower().startswith("y"):
+        return "Y"
+    if s.lower().startswith("n"):
+        return "N"
+    return s
+
+
+def _normalize_manufacturer(v):
+    if _is_blank(v):
+        return "UNKNOWN"
+    m = _as_text(v).upper()
+    # "?", "???", "N/A", "N.A." are all somebody writing "we don't know"
+    if "?" in m or re.sub(r"[^A-Z]", "", m) == "NA":
+        return "UNKNOWN"
+    # the shortcut table wins at any length, so short aliases like "AMERICAN"
+    # map too; a long name with no shortcut stays long and flags orange later
+    return MANUFACTURERS.get(m, m)
+
+
+def _normalize_type(v):
+    # only ASME / DOT allowed; any mix of letters resolves on the first A or D
+    s = _as_text(v)
+    letters = re.sub(r"[^A-Za-z]", "", s).upper()
+    if letters[:1] == "A":
+        return "ASME"
+    if letters[:1] == "D":
+        return "DOT"
+    return s  # unrecognized -> flagged red later
+
+
+def _strip_commas(v):
+    # commas and stray spaces are formatting, not data: "1,234" -> "1234"
+    return re.sub(r"[,\s]", "", _as_text(v))
+
+
+def _normalize_size(v):
+    # no commas, no decimals: "1,000.0" -> "1000". The fraction is dropped, not
+    # deleted, so the magnitude stays right ("100.5" -> "100", never "1005").
+    # Range is checked in the flag pass.
+    s = _strip_commas(v)
+    frac = re.match(r"^(\d+)\.\d+$", s)
+    return frac.group(1) if frac else s
+
+
+# Which cleaner runs on which column. Add a column by adding a line here.
+# ManufacturerDate is missing on purpose: it needs the row's Type, so it is
+# handled separately in normalize_dataframe.
+COLUMN_CLEANERS = {
+    "Serial": _normalize_serial,
+    "CSC": _strip_commas,
+    "Serv loc": _strip_commas,
+    "Customer Owned": _normalize_customer_owned,
+    "Manufacturer": _normalize_manufacturer,
+    "Type": _normalize_type,
+    "SizeGallons": _normalize_size,
+    "SizePounds": _normalize_size,
+}
+
+# Stamped onto every row regardless of what the file said, because these mark
+# the batch rather than describe the tank. "Activity date" is stamped with
+# today's date separately.
+CONSTANT_COLUMNS = {
+    "Activity": "1",
+    "Source": "Miscellaneous",
+}
+
+
+# ---------------------------------------------------------------------------
+# ManufacturerDate gets its own section: a date reaches us in a dozen shapes,
+# and a round trip through a spreadsheet mangles several of them.
+# ---------------------------------------------------------------------------
+
+def _date_default(tank_type):
+    # nothing usable in the cell — stamp the placeholder the system expects
+    if tank_type == "ASME":
+        return "1900"
+    if tank_type == "DOT":
+        return "12 60"
+    return ""
+
+
+def _expand_year(y):
+    # two-digit years pivot at 50: "05" -> 2005, "95" -> 1995
+    if len(y) == 4:
+        return y
+    if len(y) <= 2:
+        y = y.zfill(2)
+        return "20" + y if int(y) < 50 else "19" + y
+    return None  # three digits is not a year we can trust
+
+
+def _undo_number_formatting(s):
+    """Strip the artifacts Excel and pandas leave on a date before parsing it.
+
+    None of these are real date syntax — they are what a year looks like after a
+    round trip through a spreadsheet cell or a float column.
+    """
+    s = s.lstrip("'")  # Excel's "treat this as text" marker
+    # pandas/Excel may hand us "2005.0" — collapse to a plain integer year. Only
+    # values that actually carry a decimal, so "05" keeps its leading zero
+    if "." in s or "e" in s.lower():
+        try:
+            n = float(s)
+            if n == int(n):
+                s = str(int(n))
+        except ValueError:
+            pass
+    # a fraction on something too long to be a month ("2005.5") is noise rather
+    # than a "MM.YY" separator — drop it so no year carries a decimal
+    s = re.sub(r"^(\d{3,})\.\d+$", r"\1", s)
+    # Excel stores a typed "12.60" as the number 12.6, so a lone fractional
+    # digit is a dropped trailing zero, not a one-digit year
+    return re.sub(r"^(\d{1,2})\.(\d)$", r"\g<1>.\g<2>0", s)
+
+
+def _parse_month_year(s):
+    """Pull ("MM", "YYYY", day) out of a date string, or None if unreadable.
+
+    Excel writes the cell's *displayed* text into a CSV, never the underlying
+    date, so the same tank can arrive as "Dec-95", "12/1/1995", "1995-12-01" or
+    "12 95". Parse the pieces rather than guessing at one fixed layout. The day
+    is not part of the output but is returned so the caller can spot Excel's
+    date-serial mangling; it is None when the cell carried no day.
+    """
+    tokens = [t for t in re.split(r"[\s\-/.,]+", s.strip()) if t]
+    named_month = None
+    nums = []
+    for t in tokens:
+        if t.isdigit():
+            nums.append(t)
+        elif named_month is None and t.isalpha() and t[:3].upper() in MONTHS:
+            named_month = MONTHS[t[:3].upper()]
+        else:
+            return None  # a word we don't recognize -> not a date
+
+    # "Dec-95", "1-Dec-95", "Dec 1, 1995": the last number is always the year
+    if named_month is not None:
+        if not nums:
+            return None
+        day = int(nums[0]) if len(nums) > 1 else None
+        year4 = _expand_year(nums[-1])
+        return None if year4 is None else (named_month, year4, day)
+
+    day = None
+    if len(nums) == 3:
+        if len(nums[0]) == 4:
+            month, year, day = nums[1], nums[0], int(nums[2])   # ISO 1995-12-01
+        elif int(nums[0]) <= 12:
+            month, year, day = nums[0], nums[2], int(nums[1])   # US 12/1/1995
+        else:
+            month, year, day = nums[1], nums[2], int(nums[0])   # 25/12/1995 D/M/Y
+    elif len(nums) == 2:
+        month, year = nums                          # "12 95", "06/12", "3.05"
+    elif len(nums) == 1 and len(nums[0]) in (2, 4):
+        month, year = "01", nums[0]                 # year only
+    else:
+        return None
+
+    if len(month) > 2 or not 1 <= int(month) <= 12:
+        return None
+    year4 = _expand_year(year)
+    return None if year4 is None else (month.zfill(2), year4, day)
+
+
+def _recover_serial_year(month, year4, day):
+    """Undo Excel eating a typed 4-digit year, or None if that isn't what this is.
+
+    Typing "2020" into a date-formatted cell makes Excel read it as day-serial
+    2020 and store 1905-07-12. Every year from 1900 to 2100 lands somewhere in
+    1905 and nothing else does, so a 1905 date converted back to its serial is
+    the year the user meant. Same trick as Format Cells -> Number in Excel.
+    """
+    if year4 != "1905" or day is None:
+        return None
+    try:
+        serial = (date(1905, int(month), day) - EXCEL_EPOCH).days
+    except ValueError:  # impossible day for the month
+        return None
+    return str(serial) if 1900 <= serial <= 2100 else None
+
+
+def _normalize_date(v, tank_type):
+    """Clean one date -> (value, review).
+
+    Usable input becomes a 4-digit year for ASME and "MM YY" for DOT. Anything
+    else takes the type default. `review` asks the flag pass for an orange: the
+    cell was filled but unreadable, or it was a year Excel had mangled into a
+    date serial and we put it back.
+    """
+    if _is_blank(v):
+        return _date_default(tank_type), False
+    parsed = _parse_month_year(_undo_number_formatting(_as_text(v)))
+    if parsed is None:
+        return _date_default(tank_type), True  # "UNKNOWN", "N/A", junk
+    month, year4, day = parsed
+    # a typed year Excel turned into a date serial: put the year back, but flag
+    # it so someone confirms the repair rather than trusting it blindly
+    review = False
+    recovered = _recover_serial_year(month, year4, day)
+    if recovered is not None:
+        month, year4, review = "01", recovered, True
+    if tank_type == "DOT":
+        return f"{month} {year4[2:]}", review  # month is zero-padded: "03 05"
+    return year4, review  # ASME and fallback: 4-digit year only
+
+
+# ---------------------------------------------------------------------------
+# Loading a file
+# ---------------------------------------------------------------------------
+
+def _cell_to_text(v):
+    """Flatten one Excel cell to the text the cleaning rules expect.
+
+    Reading the workbook instead of a CSV export is the whole point: a date cell
+    arrives as a real datetime, so "Dec-95" and "12/1/1995" are the same value
+    here and the display format never has to be guessed.
+    """
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):  # empty cell, NaT
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, date):  # covers datetime and pandas Timestamp
+        return v.strftime("%Y-%m-%d")
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))  # Excel hands back 500.0 for a plain 500
+    return str(v).strip()
+
+
+def read_table(path):
+    """Load a CSV or Excel workbook into an all-text DataFrame."""
+    if path.lower().endswith((".xlsx", ".xlsm", ".xltx", ".xls")):
+        # keep_default_na=False so a literal "N/A" survives as text and still
+        # trips the flag, matching how the CSV path sees it
+        df = pd.read_excel(path, sheet_name=0, dtype=object, keep_default_na=False)
+        for c in df.columns:
+            df[c] = df[c].apply(_cell_to_text)
+        return df
+    # read everything as text so nothing (Serial, integers) gets float-coerced
+    return pd.read_csv(path, dtype=str, keep_default_na=False)
+
+
+# ---------------------------------------------------------------------------
+# The whole-file pass: clean every column, then judge what came out
+# ---------------------------------------------------------------------------
+
+def _bad_size_gallons(v):
+    # must be a whole number of gallons inside the tank sizes we stock
+    s = str(v)
+    return not (s.isdigit() and SIZE_GALLONS_MIN <= int(s) <= SIZE_GALLONS_MAX)
+
+
+def _not_a_number(v):
+    return _is_blank(v) or not _is_numeric(v)
+
+
+def _flag_rows(flags, column, values, is_bad, color):
+    """Color every row of `column` whose value fails `is_bad`.
+
+    `values` is None when the file has no such column, in which case there is
+    nothing to judge and no flag is raised.
+    """
+    if values is None:
+        return
+    for i, v in enumerate(values):
+        if is_bad(v):
+            flags[(i, column)] = color
+
+
+def normalize_dataframe(df):
+    """Clean `df` in place and return {(row_index, column_name): 'RED'|'ORANGE'}.
+
+    Columns the file does not have are skipped, never invented — a missing
+    column raises no flags. Cleaning runs first so validation always judges the
+    cleaned value, not what the operator originally typed.
+    """
+    cols = df.columns
+
+    for column, clean in COLUMN_CLEANERS.items():
+        if column in cols:
+            df[column] = df[column].apply(clean)
+
+    # the date needs its row's Type, so it can't go in the table above; it also
+    # reports which rows want review (unreadable, or recovered from a serial)
+    date_review = [False] * len(df)
+    if "ManufacturerDate" in cols:
+        types = df["Type"] if "Type" in cols else [""] * len(df)
+        cleaned = [_normalize_date(d, t) for d, t in zip(df["ManufacturerDate"], types)]
+        df["ManufacturerDate"] = [value for value, _ in cleaned]
+        date_review = [review for _, review in cleaned]
+
+    # batch markers for new additions: same value stamped on every row
+    for column, marker in CONSTANT_COLUMNS.items():
+        if column in cols:
+            df[column] = marker
+    if "Activity date" in cols:
+        df["Activity date"] = pd.Timestamp.today().strftime("%m/%d/%Y")
+
+    # ---- validation pass over the cleaned values ----
+    flags = {}
+
+    def column(name):
+        return df[name].tolist() if name in cols else None
+
+    typ = column("Type")
+    mfr = column("Manufacturer")
+    sizep = column("SizePounds")
+
+    _flag_rows(flags, "CSC", column("CSC"), _not_a_number, "RED")
+    _flag_rows(flags, "Serv loc", column("Serv loc"), _not_a_number, "ORANGE")
+    _flag_rows(flags, "Equipment Type", column("Equipment Type"),
+               lambda v: str(v).strip() != "1", "RED")
+    _flag_rows(flags, "Type", typ, lambda v: v not in ("ASME", "DOT"), "RED")
+    _flag_rows(flags, "SizeGallons", column("SizeGallons"), _bad_size_gallons, "RED")
+    # anything still over the length cap had no shortcut in MANUFACTURERS
+    _flag_rows(flags, "Manufacturer", mfr,
+               lambda v: len(str(v)) > MANUFACTURER_MAX_LEN, "ORANGE")
+    # unreadable and stamped with the type default, or a year recovered from
+    # Excel's date-serial mangling — either way, worth a human look
+    _flag_rows(flags, "ManufacturerDate", date_review, bool, "ORANGE")
+
+    # SizePounds is the one rule that reads other columns, so it gets its own
+    # loop: pounds are required for DOT tanks and for anything Worthington made
+    if sizep is not None:
+        for i, v in enumerate(sizep):
+            required = (
+                (typ is not None and typ[i] == "DOT")
+                or (mfr is not None and str(mfr[i]).strip().upper() == "WORTHINGTON")
+            )
+            if required and _is_blank(v):
+                flags[(i, "SizePounds")] = "ORANGE"
+
+    return flags
+
+
+# ---------------------------------------------------------------------------
+# The window. Displays what the rules above decided; holds no rules of its own.
+# ---------------------------------------------------------------------------
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Cleaned Additions")
         self.resize(1400, 700)
+
+        self.cell_flags = {}
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -33,9 +459,9 @@ class MainWindow(QMainWindow):
 
         top_bar = QHBoxLayout()
 
-        # Open Button
-        open_btn = QPushButton("Open CSV")
-        open_btn.clicked.connect(self.load_csv)
+        # Open Button — Excel is the preferred input (real dates, no format guessing)
+        open_btn = QPushButton("Open Excel / CSV")
+        open_btn.clicked.connect(self.load_file)
 
         # Save Button
         self.save_btn = QPushButton("Save Cleaned CSV")
@@ -99,112 +525,53 @@ class MainWindow(QMainWindow):
             self.expand_left_btn.setText("Restore" if panel == 0 else "Max")
             self.expand_right_btn.setText("Restore" if panel == 1 else "Max")
 
-    # load CSV, run cleaning, then fill both tables
-    def load_csv(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV Files (*.csv)")
+    # load the additions file, run cleaning, then fill both tables
+    def load_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Additions File", "",
+            "Excel or CSV (*.xlsx *.xlsm *.xls *.csv);;Excel Workbook (*.xlsx *.xlsm *.xls);;CSV Files (*.csv)",
+        )
         if not path:
             return
 
-        self.original_df = pd.read_csv(path)
+        try:
+            self.original_df = read_table(path)
+        except Exception as exc:  # unreadable file, wrong sheet, locked by Excel
+            QMessageBox.critical(self, "Could not open file", f"{path}\n\n{exc}")
+            return
+
         self.cleaned_df = self.original_df.copy()
         self._normalize(self.cleaned_df)
         self._populate_tables()
         self.save_btn.setEnabled(True)
 
-    # main logic for data cleaning
+    # main logic for data cleaning — stores per-cell validation flags for display
     def _normalize(self, df):
-        # Yes/No normalization
-        responses_dict = {
-            "YES": "Y", "Yes": "Y", "yes": "Y", "y": "Y",
-            "NO": "N",  "No": "N",  "no": "N",  "n": "N",
-        }
-        if "Customer Owned" in df.columns:
-            df["Customer Owned"] = df["Customer Owned"].replace(responses_dict)
+        self.cell_flags = normalize_dataframe(df)
 
-        # dict hits get normalized; misses are left as-is and flagged orange in the table
-        manufacturers_dict = {
-            "QUALITY STEEL": "QUALITY STL",
-            "AMERICAN WELDING AND TANK": "AWT",
-            "NATIONAL BUTANE": "NAT BUTANE",
-            "AMERICAN": "AWT"
-        }
-        def normalize_manufacturer(manufacturer):
-            if pd.isna(manufacturer):
-                return "UNKNOWN"
-            manufacturer = str(manufacturer).strip().upper()
-            if len(manufacturer) <= MANUFACTURER_MAX_LEN:
-                return manufacturer
-            if manufacturer in manufacturers_dict:
-                return manufacturers_dict[manufacturer]
-            return manufacturer
-        if "Manufacturer" in df.columns:
-            df["Manufacturer"] = df["Manufacturer"].apply(normalize_manufacturer)
-
-        # ends-with-DOT wins; otherwise any ASME variation → "ASME"
-        def normalize_type(val):
-            if pd.isna(val):
-                return val
-            s = str(val).strip()
-            if re.search(r'DOT\s*$', s, re.IGNORECASE):
-                return "DOT"
-            if re.search(r'a\.?s\.?m\.?e\.?', s, re.IGNORECASE):
-                return "ASME"
-            return s
-        if "Type" in df.columns:
-            df["Type"] = df["Type"].apply(normalize_type)
-
-        # ASME → 4-digit year only; DOT → MM/YY (defaults month to 01 if only year given)
-        def normalize_date(val, tank_type):
-            if pd.isna(val):
-                return val
-            s = str(val).strip()
-            # pandas reads plain years as floats (e.g. 2005.0) — convert back
-            try:
-                n = float(s)
-                if n == int(n):
-                    s = str(int(n))
-            except ValueError:
-                pass
-            sep = re.match(r'^(\d{1,2})[/\-\. ](\d{2,4})$', s)
-            if sep:
-                month = sep.group(1).zfill(2)
-                yr = sep.group(2)
-                year4 = yr if len(yr) == 4 else ("20" + yr if int(yr) < 50 else "19" + yr)
-            elif re.match(r'^\d{4}$', s):
-                month, year4 = "01", s
-            elif re.match(r'^\d{2}$', s):
-                month = "01"
-                year4 = ("20" + s if int(s) < 50 else "19" + s)
-            else:
-                return s  # unrecognized — leave as-is
-            if tank_type == "DOT":
-                return f"{month} {year4[2:]}"
-            return year4  # ASME and fallback: year only
-
-        if "ManufacturerDate" in df.columns:
-            if "Type" in df.columns:
-                df["ManufacturerDate"] = df.apply(
-                    lambda row: normalize_date(row["ManufacturerDate"], row["Type"]), axis=1
-                )
-            else:
-                df["ManufacturerDate"] = df["ManufacturerDate"].fillna(1900)
-
-        if "Activity" in df.columns:
-            df["Activity"] = df["Activity"].fillna(1)
-        if "Source" in df.columns:
-            df["Source"] = df["Source"].fillna("Miscellaneous")
-        if "Activity date" in df.columns:
-            today = pd.Timestamp.today().strftime("%m/%d/%Y")
-            df["Activity date"] = df["Activity date"].fillna(today)
-
-    # pandas reads integer columns with any NaN as float64, so 1 becomes 1.0 — convert back
     def _cell_str(self, df, r, c):
+        """One cell as display text. Deliberately not `_as_text`: the original
+        side must show exactly what was in the file, untrimmed, or the
+        changed-by-cleaning comparison would miss whitespace-only edits."""
         val = df.iloc[r, c]
-        if pd.isna(val):
+        if val is None or (isinstance(val, float) and pd.isna(val)):
             return ""
-        if isinstance(val, float) and val.is_integer():
-            return str(int(val))
         return str(val)
+
+    @staticmethod
+    def _make_item(text, flag, changed, changed_color, editable):
+        """Build one table cell. A validation flag always outranks the
+        was-changed tint, so a problem is never hidden by a green cell."""
+        item = QTableWidgetItem(text)
+        if not editable:
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        if flag == "RED":
+            item.setBackground(RED)
+        elif flag == "ORANGE":
+            item.setBackground(ORANGE)
+        elif changed:
+            item.setBackground(changed_color)
+        return item
 
     def _populate_tables(self):
         orig = self.original_df
@@ -219,64 +586,20 @@ class MainWindow(QMainWindow):
             table.setHorizontalHeaderLabels(headers)
             table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
 
-        mfr_col = headers.index("Manufacturer") if "Manufacturer" in headers else -1
-        equipment_type_col = headers.index("Equipment Type") if "Equipment Type" in headers else -1
-        serv_loc_col = headers.index("Serv loc") if "Serv loc" in headers else -1
-        type_col = headers.index("Type") if "Type" in headers else -1
-        size_pounds_col = headers.index("SizePounds") if "SizePounds" in headers else -1
-
-        def _is_numeric(v):
-            try:
-                float(v)
-                return True
-            except (ValueError, TypeError):
-                return False
-
         for r in range(rows):
             for c in range(cols):
+                col = headers[c]
                 orig_val = self._cell_str(orig, r, c)
                 clean_val = self._cell_str(cleaned, r, c)
                 changed = orig_val != clean_val
+                flag = self.cell_flags.get((r, col))
 
-                # long manufacturer not found in lookup dict — flag orange on both sides
-                is_mfr_miss = (c == mfr_col and not changed and len(orig_val) > MANUFACTURER_MAX_LEN)
-                # equipment type must be 1. Flag red in cleaned output
-                is_invalid_equipment_type = (c == equipment_type_col and clean_val != "1")
-                # Serv loc must be numeric — flag red on both sides
-                is_serv_loc_invalid = (
-                    serv_loc_col != -1 and c == serv_loc_col
-                    and clean_val != "" and not _is_numeric(clean_val)
-                )
-                # DOT tank with no size — flag SizePounds red on cleaned side
-                is_dot_no_size = (
-                    size_pounds_col != -1 and type_col != -1 and c == size_pounds_col
-                    and self._cell_str(cleaned, r, type_col) == "DOT"
-                    and clean_val == ""
-                )
-
-                # original side: read-only; red if a change was made, orange if manufacturer needs review
-                # strip the editable flag via bitwise AND with its complement
-                orig_item = QTableWidgetItem(orig_val)
-                orig_item.setFlags(orig_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                if changed:
-                    orig_item.setBackground(RED)
-                elif is_mfr_miss:
-                    orig_item.setBackground(ORANGE)
-                elif is_serv_loc_invalid:
-                    orig_item.setBackground(RED)
-                self.original_table.setItem(r, c, orig_item)
-
-                # cleaned side: green if normalized, orange if manufacturer needs review
-                clean_item = QTableWidgetItem(clean_val)
-                if changed:
-                    clean_item.setBackground(GREEN)
-                elif is_mfr_miss:
-                    clean_item.setBackground(ORANGE)
-                self.cleaned_table.setItem(r, c, clean_item)
-
-                # these checks override other colors on the cleaned side
-                if is_invalid_equipment_type or is_serv_loc_invalid or is_dot_no_size:
-                    clean_item.setBackground(RED)
+                # original side is read-only and tints changed cells blue; the
+                # cleaned side is editable and tints them green
+                self.original_table.setItem(r, c, self._make_item(
+                    orig_val, flag, changed, BLUE, editable=False))
+                self.cleaned_table.setItem(r, c, self._make_item(
+                    clean_val, flag, changed, GREEN, editable=True))
 
     # read back from the live table so any manual edits in the UI are captured
     def save_csv(self):
