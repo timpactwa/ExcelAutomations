@@ -8,8 +8,10 @@ a = Analysis(
     datas=[],
     # pandas only imports openpyxl when read_excel is actually called, so
     # PyInstaller can't see it — without this the frozen app raises
-    # "Missing optional dependency 'openpyxl'" on every Excel open
-    hiddenimports=['openpyxl'],
+    # "Missing optional dependency 'openpyxl'" on every Excel open.
+    # tzdata is Windows' only source of zone rules for zoneinfo, needed to
+    # stamp batch filenames in Eastern time.
+    hiddenimports=['openpyxl', 'tzdata'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

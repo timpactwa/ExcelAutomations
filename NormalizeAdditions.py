@@ -26,7 +26,7 @@ Version: 7/31/2026
 
 import re
 import sys
-from datetime import date
+from datetime import date, datetime
 import pandas as pd
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -47,6 +47,16 @@ SIZE_GALLONS_MAX = 5000
 
 # Excel counts days from here (serial 0); the offset absorbs its 1900 leap bug
 EXCEL_EPOCH = date(1899, 12, 30)
+
+# Batches are stamped in Eastern wall-clock time so the name matches the clock
+# in the office no matter what zone the machine is set to. "America/New_York"
+# rather than a fixed -5 because it has to be EDT in summer and EST in winter.
+# Falls back to the machine clock if the zone database isn't available.
+try:
+    from zoneinfo import ZoneInfo
+    EASTERN = ZoneInfo("America/New_York")
+except Exception:  # no tzdata on this machine
+    EASTERN = None
 
 # Excel writes month names into CSVs whenever the cell is formatted that way
 MONTHS = {
@@ -335,6 +345,15 @@ def _cell_to_text(v):
     return str(v).strip()
 
 
+def batch_filename(now=None):
+    """Default name for a saved batch: AMS_Batch_MMDDYYYY_HHMM.csv.
+
+    Stamped at save time, in Eastern time, on a 24-hour clock — so a batch saved
+    at 1:45pm on July 31 2026 becomes AMS_Batch_07312026_1345.csv.
+    """
+    return (now or datetime.now(EASTERN)).strftime("AMS_Batch_%m%d%Y_%H%M.csv")
+
+
 def read_table(path):
     """Load a CSV or Excel workbook into an all-text DataFrame."""
     if path.lower().endswith((".xlsx", ".xlsm", ".xltx", ".xls")):
@@ -604,7 +623,7 @@ class MainWindow(QMainWindow):
     # read back from the live table so any manual edits in the UI are captured
     def save_csv(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Cleaned CSV", "cleaned_additions.csv", "CSV Files (*.csv)"
+            self, "Save Cleaned CSV", batch_filename(), "CSV Files (*.csv)"
         )
         if not path:
             return
