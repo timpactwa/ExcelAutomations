@@ -1,2 +1,7 @@
 .venv
 *.csv
+
+# PyInstaller output — rebuilt from Clean_Additions.spec, ~200 MB combined
+build/
+dist/
+__pycache__/
